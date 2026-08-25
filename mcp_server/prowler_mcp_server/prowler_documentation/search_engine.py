@@ -54,8 +54,7 @@ class ProwlerDocsSearchEngine:
         )
 
     def search(self, query: str, page_size: int = 5) -> list[SearchResult]:
-        """
-        Search documentation using Mintlify API.
+        """Search documentation using Mintlify API.
 
         Args:
             query: Search query string
@@ -63,108 +62,106 @@ class ProwlerDocsSearchEngine:
 
         Returns:
             list of search results
+
+        Raises:
+            httpx.HTTPError: If the search request failed, which is not the same
+                answer as no matches
         """
-        try:
-            # Construct request body
-            payload = {
-                "query": query,
-                "search_type": "fulltext",
-                "extend_results": True,
-                "highlight_options": {
-                    "highlight_window": 10,
-                    "highlight_max_num": 1,
-                    "highlight_max_length": 2,
-                    "highlight_strategy": "exactmatch",
-                    "highlight_delimiters": ["?", ",", ".", "!", "\n"],
-                },
-                "score_threshold": 0.2,
-                "filters": {"must_not": [{"field": "tag_set", "match": ["code"]}]},
-                "page_size": page_size,
-                "group_size": 3,
-            }
+        # Construct request body
+        payload = {
+            "query": query,
+            "search_type": "fulltext",
+            "extend_results": True,
+            "highlight_options": {
+                "highlight_window": 10,
+                "highlight_max_num": 1,
+                "highlight_max_length": 2,
+                "highlight_strategy": "exactmatch",
+                "highlight_delimiters": ["?", ",", ".", "!", "\n"],
+            },
+            "score_threshold": 0.2,
+            "filters": {"must_not": [{"field": "tag_set", "match": ["code"]}]},
+            "page_size": page_size,
+            "group_size": 3,
+        }
 
-            # Make request to Mintlify API
-            response = self.mintlify_client.post(
-                self.api_base_url,
-                json=payload,
-            )
-            response.raise_for_status()
-            data = response.json()
+        # Make request to Mintlify API
+        response = self.mintlify_client.post(
+            self.api_base_url,
+            json=payload,
+        )
+        response.raise_for_status()
+        data = response.json()
 
-            # Parse results
-            results = []
-            for result in data.get("results", []):
-                group = result.get("group", {})
-                chunks = result.get("chunks", [])
+        # Parse results
+        results = []
+        for result in data.get("results", []):
+            group = result.get("group", {})
+            chunks = result.get("chunks", [])
 
-                # Get document path and title from group
-                doc_path = group.get("name", "")
-                group_title = group.get("name", "").replace("/", " / ").title()
+            # Get document path and title from group
+            doc_path = group.get("name", "")
+            group_title = group.get("name", "").replace("/", " / ").title()
 
-                # If chunks exist, use the first chunk's title from metadata
-                title = group_title
-                if chunks:
-                    first_chunk = chunks[0].get("chunk", {})
-                    metadata = first_chunk.get("metadata", {})
-                    title = metadata.get("title", group_title)
+            # If chunks exist, use the first chunk's title from metadata
+            title = group_title
+            if chunks:
+                first_chunk = chunks[0].get("chunk", {})
+                metadata = first_chunk.get("metadata", {})
+                title = metadata.get("title", group_title)
 
-                # Construct full URL to docs
-                full_url = f"{self.docs_base_url}/{doc_path}"
+            # Construct full URL to docs
+            full_url = f"{self.docs_base_url}/{doc_path}"
 
-                # Extract highlights and scores from chunks
-                highlights = []
-                max_score = 0.0
-                for chunk_data in chunks:
-                    chunk_highlights = chunk_data.get("highlights", [])
-                    highlights.extend(chunk_highlights)
-                    # Track the highest score among all chunks in this group
-                    chunk_score = chunk_data.get("score", 0.0)
-                    max_score = max(max_score, chunk_score)
+            # Extract highlights and scores from chunks
+            highlights = []
+            max_score = 0.0
+            for chunk_data in chunks:
+                chunk_highlights = chunk_data.get("highlights", [])
+                highlights.extend(chunk_highlights)
+                # Track the highest score among all chunks in this group
+                chunk_score = chunk_data.get("score", 0.0)
+                max_score = max(max_score, chunk_score)
 
-                results.append(
-                    SearchResult(
-                        path=doc_path,
-                        title=title,
-                        url=full_url,
-                        highlights=highlights,
-                        score=max_score,
-                    )
+            results.append(
+                SearchResult(
+                    path=doc_path,
+                    title=title,
+                    url=full_url,
+                    highlights=highlights,
+                    score=max_score,
                 )
+            )
 
-            return results
-
-        except Exception as e:
-            # Return empty list on error
-            print(f"Search error: {e}")
-            return []
+        return results
 
     def get_document(self, doc_path: str) -> str | None:
-        """
-        Get full document content from Mintlify documentation.
+        """Get full document content from Mintlify documentation.
 
         Args:
             doc_path: Path to the documentation file (e.g., "getting-started/installation")
 
         Returns:
-            Full markdown content of the documentation, or None if not found
+            Full markdown content of the documentation, or None if there is no
+            page at that path
+
+        Raises:
+            httpx.HTTPError: If the fetch failed for any reason other than a 404
         """
-        try:
-            # Clean up the path
-            doc_path = doc_path.rstrip("/")
+        # Clean up the path
+        doc_path = doc_path.rstrip("/")
 
-            # Add .md extension if not present (Mintlify serves both .md and .mdx)
-            if not doc_path.endswith(".md"):
-                doc_path = f"{doc_path}.md"
+        # Add .md extension if not present (Mintlify serves both .md and .mdx)
+        if not doc_path.endswith(".md"):
+            doc_path = f"{doc_path}.md"
 
-            # Construct Mintlify URL
-            url = f"{self.docs_base_url}/{doc_path}"
+        # Construct Mintlify URL
+        url = f"{self.docs_base_url}/{doc_path}"
 
-            # Fetch the documentation page
-            response = self.docs_client.get(url)
-            response.raise_for_status()
-
-            return response.text
-
-        except Exception as e:
-            print(f"Error fetching document: {e}")
+        # Fetch the documentation page
+        response = self.docs_client.get(url)
+        if response.status_code == 404:
             return None
+        response.raise_for_status()
+
+        return response.text
