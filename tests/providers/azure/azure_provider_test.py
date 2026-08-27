@@ -1926,12 +1926,14 @@ class TestAzureProviderCertificateAuth:
                 certificate_content=self._CERT_CONTENT_B64,
             )
 
-        certificate_credential.assert_called_once_with(
-            client_id=self._CLIENT_ID,
-            tenant_id=self._TENANT_ID,
-            certificate_data=base64.b64decode(self._CERT_CONTENT_B64),
-            authority=None,
+        assert certificate_credential.call_count == 1
+        credential_kwargs = certificate_credential.call_args.kwargs
+        assert credential_kwargs["client_id"] == self._CLIENT_ID
+        assert credential_kwargs["tenant_id"] == self._TENANT_ID
+        assert credential_kwargs["certificate_data"] == base64.b64decode(
+            self._CERT_CONTENT_B64
         )
+        assert credential_kwargs["authority"] is None
         certificate_credential.return_value.get_token.assert_called_once_with(
             "https://graph.microsoft.com/.default"
         )
@@ -2041,6 +2043,177 @@ class TestAzureProviderCertificateAuth:
 
         assert connection.is_connected is False
         assert isinstance(connection.error, AzureCredentialsUnavailableError)
+
+    @staticmethod
+    def _leaf_first_bundle():
+        # Reuse the leaf-first helper from the ordering suite so certificate
+        # timeout tests exercise a real bundle instead of the tiny DER blob.
+        from datetime import datetime, timedelta, timezone
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Prowler")])
+        certificate = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(subject)
+            .public_key(private_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.now(timezone.utc))
+            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=1))
+            .sign(private_key, hashes.SHA256())
+        )
+        return certificate.public_bytes(
+            serialization.Encoding.PEM
+        ) + private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+
+    def test_verify_client_certificate_content_connect_timeout_translates_to_credentials_unavailable(
+        self,
+    ):
+        # Exercise the full pipeline: real `CertificateCredential`,
+        # real `RequestsTransport`, only the underlying `requests.Session`
+        # is stubbed. `azure.identity` decorates `_request_token` with
+        # `wrap_exceptions`, so the transport's `ConnectTimeout` reaches
+        # `verify_client` as `ClientAuthenticationError` with the
+        # `ServiceRequestError` cause preserved via `__cause__`.
+        import base64
+
+        with (
+            patch.object(
+                requests.Session,
+                "request",
+                side_effect=requests.ConnectTimeout("hung transport"),
+            ) as session_request,
+            pytest.raises(AzureCredentialsUnavailableError),
+        ):
+            AzureProvider.verify_client(
+                self._TENANT_ID,
+                self._CLIENT_ID,
+                client_secret=None,
+                region_config=self._region_config(),
+                certificate_content=base64.b64encode(
+                    self._leaf_first_bundle()
+                ).decode(),
+            )
+
+        # `retry_total=0` on the credential — Azure Core must not replay
+        # the failed transport request.
+        assert session_request.call_count == 1
+
+    def test_verify_client_certificate_path_read_timeout_translates_to_credentials_unavailable(
+        self, tmp_path
+    ):
+        # `requests.ReadTimeout` becomes `ServiceResponseError` in Azure
+        # Core (not `ServiceRequestError`), so this test also covers the
+        # `ServiceResponseError` branch of the cause-chain walk.
+        certificate_path = tmp_path / "prowler-cert.pem"
+        certificate_path.write_bytes(self._leaf_first_bundle())
+
+        with (
+            patch.object(
+                requests.Session,
+                "request",
+                side_effect=requests.ReadTimeout("read timed out"),
+            ) as session_request,
+            pytest.raises(AzureCredentialsUnavailableError),
+        ):
+            AzureProvider.verify_client(
+                self._TENANT_ID,
+                self._CLIENT_ID,
+                client_secret=None,
+                region_config=self._region_config(),
+                certificate_path=str(certificate_path),
+            )
+
+        assert session_request.call_count == 1
+
+    def test_test_connection_certificate_content_transport_timeout_returns_credentials_unavailable_error(
+        self,
+    ):
+        # `raise_on_exception=False` is the API contract for the certificate
+        # path too: consumers must receive
+        # `Connection(error=AzureCredentialsUnavailableError)`.
+        import base64
+
+        with patch.object(
+            requests.Session,
+            "request",
+            side_effect=requests.ConnectTimeout("hung transport"),
+        ) as session_request:
+            connection = AzureProvider.test_connection(
+                tenant_id=self._TENANT_ID,
+                client_id=self._CLIENT_ID,
+                certificate_auth=True,
+                certificate_content=base64.b64encode(
+                    self._leaf_first_bundle()
+                ).decode(),
+                region="AzureCloud",
+                raise_on_exception=False,
+            )
+
+        assert connection.is_connected is False
+        assert isinstance(connection.error, AzureCredentialsUnavailableError)
+        assert session_request.call_count == 1
+
+    def test_test_connection_certificate_path_transport_timeout_returns_credentials_unavailable_error(
+        self, tmp_path
+    ):
+        certificate_path = tmp_path / "prowler-cert.pem"
+        certificate_path.write_bytes(self._leaf_first_bundle())
+
+        with patch.object(
+            requests.Session,
+            "request",
+            side_effect=requests.ReadTimeout("read timed out"),
+        ) as session_request:
+            connection = AzureProvider.test_connection(
+                tenant_id=self._TENANT_ID,
+                client_id=self._CLIENT_ID,
+                certificate_auth=True,
+                certificate_path=str(certificate_path),
+                region="AzureCloud",
+                raise_on_exception=False,
+            )
+
+        assert connection.is_connected is False
+        assert isinstance(connection.error, AzureCredentialsUnavailableError)
+        assert session_request.call_count == 1
+
+    def test_verify_client_certificate_cleanup_failure_preserves_typed_error(self):
+        # A failure in `credential.close()` must not replace the primary
+        # `AzureCredentialsUnavailableError`: the caller has to see the
+        # actionable transport error, not a cleanup traceback.
+        import base64
+
+        with (
+            patch.object(
+                requests.Session,
+                "request",
+                side_effect=requests.ConnectTimeout("hung transport"),
+            ),
+            patch(
+                "azure.identity.CertificateCredential.close",
+                side_effect=RuntimeError("close boom"),
+            ),
+            pytest.raises(AzureCredentialsUnavailableError),
+        ):
+            AzureProvider.verify_client(
+                self._TENANT_ID,
+                self._CLIENT_ID,
+                client_secret=None,
+                region_config=self._region_config(),
+                certificate_content=base64.b64encode(
+                    self._leaf_first_bundle()
+                ).decode(),
+            )
 
     def test_verify_client_without_credential_material_returns(self):
         assert (
@@ -2607,6 +2780,363 @@ class TestValidateCertificateBundleOrdering:
         # `load_pem_private_key(password=None)` raises TypeError for
         # encrypted keys; the caller relies on that exception type to route
         # to the typed certificate errors.
+        with pytest.raises(TypeError):
+            validate_certificate_bundle(cert_pem + encrypted_key_pem)
+
+    def test_setup_session_azure_credentials_certificate_path_receives_leaf_first_bundle(
+        self, tmp_path
+    ):
+        # `setup_session` has a distinct branch for the API/UI path when the
+        # bundle is delivered as a file path instead of inline base64. It
+        # must also normalize before instantiating `CertificateCredential`.
+        leaf_cert_pem, leaf_key_pem = self._self_signed()
+        other_cert_pem, _ = self._self_signed()
+        bundle = other_cert_pem + leaf_cert_pem + leaf_key_pem
+
+        certificate_path = tmp_path / "prowler-cert.pem"
+        certificate_path.write_bytes(bundle)
+
+        region_config = AzureProvider.setup_region_config("AzureCloud")
+
+        with patch(
+            "prowler.providers.azure.azure_provider.CertificateCredential"
+        ) as cert_credential:
+            AzureProvider.setup_session(
+                az_cli_auth=False,
+                sp_env_auth=False,
+                browser_auth=False,
+                managed_identity_auth=False,
+                certificate_auth=False,
+                certificate_path=None,
+                tenant_id=None,
+                azure_credentials={
+                    "tenant_id": "12345678-1234-1234-1234-123456789012",
+                    "client_id": "87654321-4321-4321-4321-210987654321",
+                    "client_secret": None,
+                    "certificate_content": None,
+                    "certificate_path": str(certificate_path),
+                },
+                region_config=region_config,
+            )
+
+        certificate_data = cert_credential.call_args.kwargs["certificate_data"]
+        assert certificate_data.startswith(leaf_cert_pem)
+        assert other_cert_pem not in certificate_data
+
+    def test_verify_client_certificate_content_receives_leaf_first_bundle(self):
+        # `verify_client` builds its own `CertificateCredential` (not via
+        # `_build_certificate_credential`), so the leaf-first invariant must
+        # be verified here too.
+        import base64
+
+        leaf_cert_pem, leaf_key_pem = self._self_signed()
+        other_cert_pem, _ = self._self_signed()
+        bundle = other_cert_pem + leaf_cert_pem + leaf_key_pem
+
+        region_config = AzureProvider.setup_region_config("AzureCloud")
+
+        with patch(
+            "prowler.providers.azure.azure_provider.CertificateCredential"
+        ) as cert_credential:
+            AzureProvider.verify_client(
+                "12345678-1234-1234-1234-123456789012",
+                "87654321-4321-4321-4321-210987654321",
+                client_secret=None,
+                region_config=region_config,
+                certificate_content=base64.b64encode(bundle).decode(),
+            )
+
+        certificate_data = cert_credential.call_args.kwargs["certificate_data"]
+        assert certificate_data.startswith(leaf_cert_pem)
+        assert other_cert_pem not in certificate_data
+
+    def test_verify_client_certificate_path_receives_leaf_first_bundle(self, tmp_path):
+        leaf_cert_pem, leaf_key_pem = self._self_signed()
+        other_cert_pem, _ = self._self_signed()
+        bundle = other_cert_pem + leaf_cert_pem + leaf_key_pem
+
+        certificate_path = tmp_path / "prowler-cert.pem"
+        certificate_path.write_bytes(bundle)
+
+        region_config = AzureProvider.setup_region_config("AzureCloud")
+
+        with patch(
+            "prowler.providers.azure.azure_provider.CertificateCredential"
+        ) as cert_credential:
+            AzureProvider.verify_client(
+                "12345678-1234-1234-1234-123456789012",
+                "87654321-4321-4321-4321-210987654321",
+                client_secret=None,
+                region_config=region_config,
+                certificate_path=str(certificate_path),
+            )
+
+        certificate_data = cert_credential.call_args.kwargs["certificate_data"]
+        assert certificate_data.startswith(leaf_cert_pem)
+        assert other_cert_pem not in certificate_data
+
+    def test_validate_static_credentials_returns_leaf_first_certificate_content(self):
+        # `validate_static_credentials` re-encodes the certificate_content
+        # after normalization so downstream `CertificateCredential` calls
+        # never re-parse the un-normalized bundle. The persisted value must
+        # decode back to leaf-first bytes.
+        import base64
+
+        leaf_cert_pem, leaf_key_pem = self._self_signed()
+        other_cert_pem, _ = self._self_signed()
+        bundle = other_cert_pem + leaf_cert_pem + leaf_key_pem
+
+        with patch.object(AzureProvider, "verify_client"):
+            credentials = AzureProvider.validate_static_credentials(
+                tenant_id="12345678-1234-1234-1234-123456789012",
+                client_id="87654321-4321-4321-4321-210987654321",
+                certificate_content=base64.b64encode(bundle).decode(),
+            )
+
+        stored_bundle = base64.b64decode(credentials["certificate_content"])
+        assert stored_bundle.startswith(leaf_cert_pem)
+        assert other_cert_pem not in stored_bundle
+
+
+class TestAzureProviderSignatureCompatibility:
+    """Every public entry point the certificate work touched has to preserve
+    the previous positional layout — inserting the cert kwargs anywhere
+    ahead of an existing positional parameter silently rebinds callers.
+    Freeze that contract with `inspect.signature(...).bind(...)`."""
+
+    _TENANT_ID = "12345678-1234-1234-1234-123456789012"
+    _CLIENT_ID = "87654321-4321-4321-4321-210987654321"
+
+    def _assert_certificate_kwargs_are_keyword_only(self, callable_):
+        import inspect
+
+        parameters = inspect.signature(callable_).parameters
+        for name in ("certificate_auth", "certificate_content", "certificate_path"):
+            if name in parameters:
+                assert (
+                    parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+                ), f"{callable_.__qualname__}: {name} must be keyword-only"
+
+    def test_azure_provider_init_positional_call_still_binds_resource_groups(self):
+        import inspect
+
+        # Master signature: `..., client_id, client_secret, resource_groups`.
+        # A caller passing everything positionally must still land
+        # `["rg-a"]` on `resource_groups`, not on any cert flag.
+        signature = inspect.signature(AzureProvider.__init__)
+        bound = signature.bind(
+            None,  # self
+            False,  # az_cli_auth
+            False,  # sp_env_auth
+            False,  # browser_auth
+            False,  # managed_identity_auth
+            self._TENANT_ID,  # tenant_id
+            "AzureCloud",  # region
+            [],  # subscription_ids
+            None,  # config_path
+            None,  # config_content
+            {},  # fixer_config
+            None,  # mutelist_path
+            None,  # mutelist_content
+            self._CLIENT_ID,  # client_id
+            "some-secret",  # client_secret
+            ["rg-a"],  # resource_groups
+        )
+
+        assert bound.arguments["resource_groups"] == ["rg-a"]
+        assert "certificate_auth" not in bound.arguments
+        assert "certificate_content" not in bound.arguments
+        assert "certificate_path" not in bound.arguments
+
+        self._assert_certificate_kwargs_are_keyword_only(AzureProvider.__init__)
+
+    def test_test_connection_positional_call_still_binds_provider_id(self):
+        import inspect
+
+        # Master signature: `..., client_id, client_secret, provider_id`.
+        signature = inspect.signature(AzureProvider.test_connection)
+        bound = signature.bind(
+            False,  # az_cli_auth
+            False,  # sp_env_auth
+            False,  # browser_auth
+            False,  # managed_identity_auth
+            self._TENANT_ID,  # tenant_id
+            "AzureCloud",  # region
+            True,  # raise_on_exception
+            self._CLIENT_ID,  # client_id
+            "some-secret",  # client_secret
+            "sub-id",  # provider_id
+        )
+
+        assert bound.arguments["provider_id"] == "sub-id"
+        assert "certificate_auth" not in bound.arguments
+        assert "certificate_content" not in bound.arguments
+        assert "certificate_path" not in bound.arguments
+
+        self._assert_certificate_kwargs_are_keyword_only(AzureProvider.test_connection)
+
+    def test_validate_static_credentials_positional_call_still_binds_region_config(
+        self,
+    ):
+        import inspect
+
+        # Master signature: `tenant_id, client_id, client_secret, region_config`.
+        signature = inspect.signature(AzureProvider.validate_static_credentials)
+        region_config = AzureProvider.setup_region_config("AzureCloud")
+        bound = signature.bind(
+            self._TENANT_ID,  # tenant_id
+            self._CLIENT_ID,  # client_id
+            "some-secret",  # client_secret
+            region_config,  # region_config
+        )
+
+        assert bound.arguments["region_config"] is region_config
+        assert "certificate_content" not in bound.arguments
+        assert "certificate_path" not in bound.arguments
+
+        # Only the certificate content/path are keyword-only here;
+        # `certificate_auth` is not part of this signature.
+        parameters = inspect.signature(
+            AzureProvider.validate_static_credentials
+        ).parameters
+        for name in ("certificate_content", "certificate_path"):
+            assert (
+                parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+            ), f"validate_static_credentials: {name} must be keyword-only"
+
+    def test_validate_arguments_positional_call_still_binds_tenant_and_client(self):
+        import inspect
+
+        # Master signature: `..., managed_identity_auth, tenant_id, client_id,
+        # client_secret`. Any external caller passing everything positionally
+        # must keep binding those three slots to the right names.
+        signature = inspect.signature(AzureProvider.validate_arguments)
+        bound = signature.bind(
+            False,  # az_cli_auth
+            False,  # sp_env_auth
+            False,  # browser_auth
+            False,  # managed_identity_auth
+            self._TENANT_ID,  # tenant_id
+            self._CLIENT_ID,  # client_id
+            "some-secret",  # client_secret
+        )
+
+        assert bound.arguments["tenant_id"] == self._TENANT_ID
+        assert bound.arguments["client_id"] == self._CLIENT_ID
+        assert bound.arguments["client_secret"] == "some-secret"
+        assert "certificate_auth" not in bound.arguments
+        assert "certificate_content" not in bound.arguments
+        assert "certificate_path" not in bound.arguments
+
+        self._assert_certificate_kwargs_are_keyword_only(
+            AzureProvider.validate_arguments
+        )
+
+    def test_setup_session_positional_call_still_binds_tenant_and_credentials(self):
+        import inspect
+
+        # Master signature: `..., managed_identity_auth, tenant_id,
+        # azure_credentials, region_config`. Callers passing the pre-cert
+        # positional shape must not rebind those slots.
+        signature = inspect.signature(AzureProvider.setup_session)
+        region_config = AzureProvider.setup_region_config("AzureCloud")
+        bound = signature.bind(
+            False,  # az_cli_auth
+            False,  # sp_env_auth
+            False,  # browser_auth
+            False,  # managed_identity_auth
+            self._TENANT_ID,  # tenant_id
+            {"tenant_id": self._TENANT_ID},  # azure_credentials
+            region_config,  # region_config
+        )
+
+        assert bound.arguments["tenant_id"] == self._TENANT_ID
+        assert bound.arguments["azure_credentials"] == {"tenant_id": self._TENANT_ID}
+        assert bound.arguments["region_config"] is region_config
+        assert "certificate_auth" not in bound.arguments
+        assert "certificate_path" not in bound.arguments
+
+        # Only the two certificate parameters are keyword-only in
+        # `setup_session` — `certificate_content` is not part of its shape.
+        parameters = inspect.signature(AzureProvider.setup_session).parameters
+        for name in ("certificate_auth", "certificate_path"):
+            assert (
+                parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+            ), f"setup_session: {name} must be keyword-only"
+
+
+class TestValidateCertificateBundleMultiKey:
+    """A PEM bundle may legitimately carry more than one private key block
+    (e.g. legacy tools that export both RSA and PKCS#8 encodings). The
+    normalizer must locate the key that actually pairs with the leaf
+    certificate, not stop at the first `-----BEGIN PRIVATE KEY-----`."""
+
+    def _self_signed(self):
+        from datetime import datetime, timedelta, timezone
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Prowler")])
+        certificate = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(subject)
+            .public_key(private_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.now(timezone.utc))
+            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=1))
+            .sign(private_key, hashes.SHA256())
+        )
+        cert_pem = certificate.public_bytes(serialization.Encoding.PEM)
+        key_pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        return cert_pem, key_pem
+
+    def test_normalizes_when_matching_key_is_second_in_bundle(self):
+        from prowler.providers.azure.lib.certificate import (
+            validate_certificate_bundle,
+        )
+
+        _, unrelated_key_pem = self._self_signed()
+        leaf_cert_pem, leaf_key_pem = self._self_signed()
+
+        # First private key belongs to an unrelated pair; the leaf's key is
+        # the second block. `.search` used to stop at the first match and
+        # falsely reject the bundle.
+        bundle = leaf_cert_pem + unrelated_key_pem + leaf_key_pem
+
+        normalized = validate_certificate_bundle(bundle)
+
+        assert normalized.startswith(leaf_cert_pem)
+        assert leaf_key_pem in normalized
+
+    def test_encrypted_single_key_still_raises_type_error(self):
+        # Guardrail for the multi-key iteration: an encrypted single key
+        # must still surface `TypeError`, which the SDK caller relies on to
+        # route to `AzureNotValidCertificateContentError`.
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        from prowler.providers.azure.lib.certificate import (
+            validate_certificate_bundle,
+        )
+
+        cert_pem, _ = self._self_signed()
+        encrypted_key_pem = rsa.generate_private_key(
+            public_exponent=65537, key_size=2048
+        ).private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.BestAvailableEncryption(b"prowler"),
+        )
+
         with pytest.raises(TypeError):
             validate_certificate_bundle(cert_pem + encrypted_key_pem)
 

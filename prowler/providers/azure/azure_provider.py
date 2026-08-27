@@ -5,15 +5,19 @@ import logging
 import os
 import re
 from argparse import ArgumentTypeError
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeoutError
 from itertools import chain
 from os import getenv
 from typing import Optional, Union
 from uuid import UUID
 
 import requests
-from azure.core.exceptions import ClientAuthenticationError, HttpResponseError
+from azure.core.exceptions import (
+    ClientAuthenticationError,
+    HttpResponseError,
+    ServiceRequestError,
+    ServiceResponseError,
+)
+from azure.core.pipeline.transport import RequestsTransport
 from azure.identity import (
     CertificateCredential,
     ClientSecretCredential,
@@ -82,7 +86,29 @@ _CERTIFICATE_THUMBPRINT_FALLBACK: dict[int, str] = {}
 
 # Matches the 30s HTTP timeout on the client-secret path so a hung Entra ID
 # endpoint cannot stall a request thread or Celery worker on either flow.
+# Applied per-request as the RequestsTransport connect and read deadlines,
+# not as a token TTL or an overall pipeline timeout.
 _TOKEN_ACQUISITION_TIMEOUT_SECONDS = 30
+
+
+def _find_transport_cause(error: BaseException) -> Optional[BaseException]:
+    """Return the first transport-level cause in the exception chain, if any.
+
+    ``azure.identity`` decorates ``_request_token`` with ``wrap_exceptions``,
+    so a ``RequestsTransport`` connect or read failure arrives at the caller
+    as ``ClientAuthenticationError`` with the underlying
+    ``ServiceRequestError``/``ServiceResponseError`` preserved via
+    ``__cause__``/``__context__``. Callers use this to distinguish a real
+    transport failure from a rejected certificate.
+    """
+    seen: set[int] = set()
+    current = error.__cause__ or error.__context__
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (ServiceRequestError, ServiceResponseError)):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
 
 
 def _build_certificate_credential(
@@ -187,10 +213,10 @@ class AzureProvider(Provider):
         fixer_config(self): Returns the fixer configuration.
         output_options(self, options: tuple): Sets the output options for the Azure provider.
         mutelist(self) -> AzureMutelist: Returns the mutelist object associated with the Azure provider.
-        validate_arguments(cls, az_cli_auth, sp_env_auth, browser_auth, managed_identity_auth, tenant_id): Validates the authentication arguments for the Azure provider.
+        validate_arguments(az_cli_auth, sp_env_auth, browser_auth, managed_identity_auth, tenant_id, client_id, client_secret, *, certificate_auth, certificate_content, certificate_path): Validates the authentication arguments for the Azure provider.
         setup_region_config(cls, region): Sets up the region configuration for the Azure provider.
         print_credentials(self): Prints the Azure credentials information.
-        setup_session(cls, az_cli_auth, sp_env_auth, browser_auth, managed_identity_auth, tenant_id, region_config): Set up the Azure session with the specified authentication method.
+        setup_session(az_cli_auth, sp_env_auth, browser_auth, managed_identity_auth, tenant_id, azure_credentials, region_config, *, certificate_auth, certificate_path): Set up the Azure session with the specified authentication method.
     """
 
     _type: str = "azure"
@@ -221,10 +247,14 @@ class AzureProvider(Provider):
         mutelist_content: dict = None,
         client_id: str = None,
         client_secret: str = None,
+        resource_groups: list = [],
+        # Keep `resource_groups` in its original positional slot for callers
+        # that pass it positionally; only the new certificate kwargs are
+        # keyword-only.
+        *,
         certificate_auth: bool = False,
         certificate_content: str = None,
         certificate_path: str = None,
-        resource_groups: list = [],
     ):
         """
         Initializes the Azure provider.
@@ -341,12 +371,12 @@ class AzureProvider(Provider):
             sp_env_auth,
             browser_auth,
             managed_identity_auth,
-            certificate_auth,
             tenant_id,
             client_id,
             client_secret,
-            certificate_content,
-            certificate_path,
+            certificate_auth=certificate_auth,
+            certificate_content=certificate_content,
+            certificate_path=certificate_path,
         )
 
         logger.info("Checking if region is different than default one")
@@ -374,11 +404,11 @@ class AzureProvider(Provider):
             sp_env_auth,
             browser_auth,
             managed_identity_auth,
-            certificate_auth,
-            certificate_path,
             tenant_id,
             azure_credentials,
             self._region_config,
+            certificate_auth=certificate_auth,
+            certificate_path=certificate_path,
         )
 
         # Set up the identity
@@ -475,12 +505,16 @@ class AzureProvider(Provider):
         sp_env_auth: bool,
         browser_auth: bool,
         managed_identity_auth: bool,
-        certificate_auth: bool,
         tenant_id: str,
         client_id: str,
         client_secret: str,
-        certificate_content: str,
-        certificate_path: str,
+        # Certificate kwargs are keyword-only so they cannot displace
+        # `tenant_id`/`client_id`/`client_secret` for callers passing
+        # positionally the way the pre-cert-auth signature accepted.
+        *,
+        certificate_auth: bool = False,
+        certificate_content: str = None,
+        certificate_path: str = None,
     ):
         """
         Validates the authentication arguments for the Azure provider.
@@ -657,11 +691,15 @@ class AzureProvider(Provider):
         sp_env_auth: bool,
         browser_auth: bool,
         managed_identity_auth: bool,
-        certificate_auth: bool,
-        certificate_path: str,
         tenant_id: str,
         azure_credentials: dict,
         region_config: AzureRegionConfig,
+        # Certificate kwargs are keyword-only so callers that pass
+        # `tenant_id`/`azure_credentials`/`region_config` positionally the
+        # way the pre-cert-auth signature accepted keep binding those slots.
+        *,
+        certificate_auth: bool = False,
+        certificate_path: str = None,
     ):
         """Returns the Azure credentials object.
 
@@ -907,14 +945,14 @@ class AzureProvider(Provider):
         raise_on_exception=True,
         client_id=None,
         client_secret=None,
-        # Certificate-based auth is keyword-only so callers cannot
-        # accidentally bind `provider_id` (which used to sit right after
-        # `client_secret`) to any of these when calling positionally.
+        provider_id=None,
+        # Keep `provider_id` in its original positional slot for callers
+        # that pass it positionally; only the new certificate kwargs are
+        # keyword-only.
         *,
         certificate_auth: bool = False,
         certificate_content: str = None,
         certificate_path: str = None,
-        provider_id=None,
     ) -> Connection:
         """Test connection to Azure subscription.
 
@@ -959,12 +997,12 @@ class AzureProvider(Provider):
                 sp_env_auth,
                 browser_auth,
                 managed_identity_auth,
-                certificate_auth,
                 tenant_id,
                 client_id,
                 client_secret,
-                certificate_content,
-                certificate_path,
+                certificate_auth=certificate_auth,
+                certificate_content=certificate_content,
+                certificate_path=certificate_path,
             )
             region_config = AzureProvider.setup_region_config(region)
 
@@ -990,11 +1028,11 @@ class AzureProvider(Provider):
                 sp_env_auth,
                 browser_auth,
                 managed_identity_auth,
-                certificate_auth,
-                certificate_path,
                 tenant_id,
                 azure_credentials,
                 region_config,
+                certificate_auth=certificate_auth,
+                certificate_path=certificate_path,
             )
             # Create a SubscriptionClient
             subscription_client = SubscriptionClient(
@@ -1187,26 +1225,24 @@ class AzureProvider(Provider):
     def check_certificate_creds_env_vars(
         check_certificate_content: bool,
         tenant_id: Optional[str] = None,
-        client_id: Optional[str] = None,
     ):
         """
         Checks the presence of required environment variables for certificate-based
         service principal authentication against Azure.
 
         Environment variables are only required when the caller has not already
-        supplied the value explicitly: an explicit ``tenant_id`` or ``client_id``
-        substitutes for AZURE_TENANT_ID / AZURE_CLIENT_ID respectively.
+        supplied the value explicitly: an explicit ``tenant_id`` substitutes
+        for AZURE_TENANT_ID. There is no CLI/API path that overrides
+        AZURE_CLIENT_ID on the env-var flow, so it must always be set.
 
         Raises:
             AzureEnvironmentVariableError: If any required environment variable
                 is missing and no explicit value was supplied.
         """
         logger.info("Azure provider: checking certificate environment variables ...")
-        env_vars: list[str] = []
+        env_vars: list[str] = ["AZURE_CLIENT_ID"]
         if not tenant_id:
             env_vars.append("AZURE_TENANT_ID")
-        if not client_id:
-            env_vars.append("AZURE_CLIENT_ID")
         if check_certificate_content:
             env_vars.append("AZURE_CERTIFICATE_CONTENT")
         for env_var in env_vars:
@@ -1533,9 +1569,13 @@ class AzureProvider(Provider):
         tenant_id: str = None,
         client_id: str = None,
         client_secret: str = None,
+        region_config: AzureRegionConfig = None,
+        # Keep `region_config` in its original positional slot for callers
+        # that pass it positionally; only the new certificate kwargs are
+        # keyword-only.
+        *,
         certificate_content: str = None,
         certificate_path: str = None,
-        region_config: AzureRegionConfig = None,
     ) -> dict:
         """
         Validates the static credentials for the Azure provider.
@@ -1680,6 +1720,7 @@ class AzureProvider(Provider):
         client_id,
         client_secret,
         region_config: AzureRegionConfig = None,
+        *,
         certificate_content: str = None,
         certificate_path: str = None,
     ) -> None:
@@ -1776,6 +1817,8 @@ class AzureProvider(Provider):
         # Graph permissions, `get_token` still returns a token — the point
         # here is to prove the private key matches an active `keyCredentials`
         # entry on the app registration.
+        credential = None
+        transport = None
         try:
             if certificate_content:
                 certificate_data = base64.b64decode(certificate_content, validate=True)
@@ -1785,23 +1828,38 @@ class AzureProvider(Provider):
             else:
                 return
 
+            # Enforce the deadline on the HTTP transport — the previous
+            # off-thread `future.result(timeout=...)` could not cancel a
+            # running `get_token`, so timeouts and non-timeout failures
+            # leaked a worker per validation under Entra ID degradation.
+            # `retry_total=0` stops Azure Core from replaying each request
+            # and multiplying the effective deadline. The transport is
+            # bound to a local so `finally` can close it even when
+            # `CertificateCredential.__init__` raises before the
+            # credential is assigned.
+            transport = RequestsTransport(
+                connection_timeout=_TOKEN_ACQUISITION_TIMEOUT_SECONDS,
+                read_timeout=_TOKEN_ACQUISITION_TIMEOUT_SECONDS,
+            )
             credential = CertificateCredential(
                 client_id=client_id,
                 tenant_id=tenant_id,
                 certificate_data=validate_certificate_bundle(certificate_data),
                 authority=region_config.authority,
+                transport=transport,
+                retry_total=0,
             )
-            # get_token has no native timeout parameter, so run it off-thread
-            # with a hard deadline (matches the 30s on the client-secret path).
-            # Manage the executor explicitly: the context-manager form calls
-            # shutdown(wait=True) on exit and would block until get_token
-            # returns anyway, defeating the timeout.
-            executor = ThreadPoolExecutor(max_workers=1)
-            future = executor.submit(credential.get_token, region_config.graph_scope)
-            try:
-                future.result(timeout=_TOKEN_ACQUISITION_TIMEOUT_SECONDS)
-            except FuturesTimeoutError as error:
-                executor.shutdown(wait=False)
+            credential.get_token(region_config.graph_scope)
+        except ClientAuthenticationError as error:
+            logger.error(
+                f"{error.__class__.__name__}[{error.__traceback__.tb_lineno}] -- {error}"
+            )
+            # `azure.identity` wraps `_request_token` with `wrap_exceptions`,
+            # so a `RequestsTransport` connect/read timeout reaches this
+            # handler as `ClientAuthenticationError`. Distinguish transport
+            # failures (credentials unavailable) from a genuinely rejected
+            # certificate by walking the cause chain.
+            if _find_transport_cause(error) is not None:
                 raise AzureCredentialsUnavailableError(
                     file=os.path.basename(__file__),
                     message=(
@@ -1810,12 +1868,6 @@ class AzureProvider(Provider):
                     ),
                     original_exception=error,
                 )
-            else:
-                executor.shutdown(wait=True)
-        except ClientAuthenticationError as error:
-            logger.error(
-                f"{error.__class__.__name__}[{error.__traceback__.tb_lineno}] -- {error}"
-            )
             if certificate_content:
                 raise AzureNotValidCertificateContentError(
                     file=os.path.basename(__file__),
@@ -1852,3 +1904,26 @@ class AzureProvider(Provider):
                 file=os.path.basename(__file__),
                 original_exception=error,
             )
+        finally:
+            # Always release the transient credential and its transport:
+            # cleanup failures are logged and swallowed so they cannot
+            # replace the primary typed exception on its way up. The
+            # transport is closed independently to cover the case where
+            # `CertificateCredential.__init__` raised before `credential`
+            # took ownership of it.
+            if credential is not None:
+                try:
+                    credential.close()
+                except Exception as cleanup_error:
+                    logger.warning(
+                        f"{cleanup_error.__class__.__name__}: failed to close "
+                        f"CertificateCredential during verify_client cleanup"
+                    )
+            elif transport is not None:
+                try:
+                    transport.close()
+                except Exception as cleanup_error:
+                    logger.warning(
+                        f"{cleanup_error.__class__.__name__}: failed to close "
+                        f"RequestsTransport during verify_client cleanup"
+                    )
